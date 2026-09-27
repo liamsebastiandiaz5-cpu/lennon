@@ -1,0 +1,575 @@
+--[[
+  Lennon-style TELEGUIADO - Steal An Egg
+  UI compacta + mecanica: Inicio -> CarryChanged -> Best -> Safe
+]]
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
+
+local LP = Players.LocalPlayer
+local PLACE_ID = 107778070777162
+local START = Vector3.new(542.3, 71.2, -368.4)
+local SAFE = Vector3.new(510.092, 70.767, -364.085)
+
+local function guiParent()
+	local ok, h = pcall(function()
+		if gethui then return gethui() end
+	end)
+	if ok and h then return h end
+	local ok2 = pcall(function() return CoreGui end)
+	if ok2 then return CoreGui end
+	return LP:WaitForChild("PlayerGui")
+end
+
+local S = {
+	Enabled = false,
+	Loop = true,
+	Speed = 500,
+	GoSafe = true,
+	WaitDay = true,
+}
+
+local Rarities = {
+	secret = true,
+	eternal = true,
+	divine = true,
+	cosmic = true,
+}
+
+local statusLbl
+local busy = false
+
+-- ===== MODULES =====
+local AskSnap, AskCarry
+local EggState, AreaEggCycle, SlotId, Assets, Mutations
+
+task.spawn(function()
+	local ok, net = pcall(function()
+		return RS:WaitForChild("Packages", 12):WaitForChild("Networking", 12)
+	end)
+	if ok and net then
+		pcall(function() AskSnap = net:WaitForChild("RF/EggWorld/AskFieldEggSnapshot", 12) end)
+		pcall(function() AskCarry = net:WaitForChild("RF/EggWorld/AskFieldEggCarry", 12) end)
+	end
+	pcall(function() EggState = require(RS.Client.EggState) end)
+	pcall(function() AreaEggCycle = require(RS.Shared.Util.AreaEggCycle) end)
+	pcall(function() SlotId = require(RS.Shared.Util.AreaEggSlotIdentity) end)
+	pcall(function() Assets = require(RS.Data.Assets) end)
+	pcall(function() Mutations = require(RS.Shared.Modules.Mutations) end)
+	print("[Lennon] remotes:", AskSnap ~= nil, "EggState:", EggState ~= nil)
+end)
+
+local function setStatus(t)
+	if statusLbl then statusLbl.Text = t end
+end
+
+local function hrp()
+	local c = LP.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function isDay()
+	if not AreaEggCycle then return true end
+	local ok, night = pcall(function()
+		return AreaEggCycle.IsNightPhase(workspace:GetServerTimeNow())
+	end)
+	return not (ok and night == true)
+end
+
+local function wallOpen()
+	local a = workspace:FindFirstChild("__OBJECTS")
+	a = a and a:FindFirstChild("Areas")
+	if not a then return true end
+	local v = a:FindFirstChild("WallStartVisual")
+	if v and v:IsA("BasePart") and v.Size.Y > 0.25 then return false end
+	local c = a:FindFirstChild("WallStartCollision")
+	if c and c:IsA("BasePart") and c.CanCollide then return false end
+	return true
+end
+
+local function canSteal()
+	if not S.WaitDay then return true end
+	return isDay() and wallOpen()
+end
+
+local function rarityOf(rec)
+	if not Assets or not Assets.Directory then return "" end
+	local e = Assets.Directory[rec.AssetCategory]
+	if not e or not e.Rarity then return "" end
+	return e.Rarity.DisplayName or e.Rarity.Name or ""
+end
+
+local function valueOf(rec)
+	if not Assets or not Assets.Directory then return 0 end
+	local e = Assets.Directory[rec.AssetCategory]
+	if not e then return 0 end
+	local rate = tonumber(e.EarningRate) or 0
+	local scale = tonumber(rec.AssetScale) or 1
+	local mult = 1
+	if rec.Mutations and Mutations and type(Mutations.EarningsFor) == "function" then
+		local ok, r = pcall(Mutations.EarningsFor, rec.Mutations)
+		if ok then mult = tonumber(r) or 1 end
+	end
+	return math.floor(rate * scale * mult + 0.5)
+end
+
+local function isStartEgg(rec)
+	if SlotId and type(SlotId.LooksLikeFirstAreaUid) == "function" then
+		local ok, r = pcall(SlotId.LooksLikeFirstAreaUid, rec.Uid)
+		if ok and r then return true end
+	end
+	if rec.BottomCFrame then
+		return (rec.BottomCFrame.Position - START).Magnitude < 100
+	end
+	return false
+end
+
+local function snapshot()
+	if not AskSnap then return {} end
+	local ok, res = pcall(function() return AskSnap:InvokeServer() end)
+	if not ok or type(res) ~= "table" or not res.Records then return {} end
+	return res.Records
+end
+
+local function fetchEggs()
+	local records = snapshot()
+	local startE, best = nil, {}
+	for _, rec in ipairs(records) do
+		if (rec.State == "Slot" or rec.State == "Dropped") and rec.BottomCFrame then
+			local rar = rarityOf(rec)
+			local data = {
+				Uid = rec.Uid,
+				NestId = rec.NestId,
+				AreaId = rec.AreaId,
+				Rarity = rar,
+				Name = (Assets and Assets.Directory and Assets.Directory[rec.AssetCategory] and Assets.Directory[rec.AssetCategory].DisplayName) or "?",
+				Value = valueOf(rec),
+				Position = rec.BottomCFrame.Position,
+				Record = rec,
+			}
+			if isStartEgg(rec) and not startE then
+				startE = data
+			end
+			local key = string.lower(tostring(rar)):gsub("%s+", "")
+			local any = false
+			for _, on in pairs(Rarities) do
+				if on then any = true break end
+			end
+			if (not any or Rarities[key]) and (not startE or data.Uid ~= startE.Uid) then
+				table.insert(best, data)
+			end
+		end
+	end
+	table.sort(best, function(a, b) return a.Value > b.Value end)
+	return best, startE
+end
+
+-- Lennon-style carry (EggState.CarryFieldEgg preferred)
+local function carryEgg(egg)
+	if not egg or not egg.Uid then return false end
+	if EggState and type(EggState.CarryFieldEgg) == "function" then
+		local nestKey = nil
+		if SlotId and egg.NestId and type(SlotId.LooksLikeFirstAreaUid) == "function" then
+			local ok, isFirst = pcall(SlotId.LooksLikeFirstAreaUid, egg.Uid)
+			if ok and isFirst and type(SlotId.SlotKey) == "function" then
+				pcall(function()
+					nestKey = SlotId.SlotKey(egg.AreaId, egg.NestId)
+				end)
+			end
+		end
+		local ok, r = pcall(function()
+			return EggState.CarryFieldEgg(egg.Uid, nestKey)
+		end)
+		if ok and r then return true end
+	end
+	if AskCarry then
+		local ok, r = pcall(function()
+			return AskCarry:InvokeServer({ Uid = egg.Uid })
+		end)
+		return ok and r == true
+	end
+	return false
+end
+
+local function spamCarry(egg, times)
+	times = times or 25
+	for i = 1, times do
+		if not S.Enabled then return false end
+		if carryEgg(egg) then return true end
+		task.wait(0.04)
+	end
+	return false
+end
+
+local function tweenTo(pos, speed)
+	local h = hrp()
+	if not h or not pos then return false end
+	speed = speed or S.Speed
+	local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum.PlatformStand = true
+	end
+	h.AssemblyLinearVelocity = Vector3.zero
+	h.AssemblyAngularVelocity = Vector3.zero
+	local target = pos + Vector3.new(0, 3, 0)
+	local dist = (h.Position - target).Magnitude
+	if dist < 4 then
+		if hum then hum.PlatformStand = false end
+		return true
+	end
+	local tw = TweenService:Create(
+		h,
+		TweenInfo.new(math.max(dist / math.max(speed, 50), 0.05), Enum.EasingStyle.Linear),
+		{ CFrame = CFrame.new(target) }
+	)
+	local conn
+	conn = RunService.Heartbeat:Connect(function()
+		if h and h.Parent then
+			h.AssemblyLinearVelocity = Vector3.zero
+			h.AssemblyAngularVelocity = Vector3.zero
+		end
+	end)
+	tw:Play()
+	tw.Completed:Wait()
+	if conn then conn:Disconnect() end
+	if h and h.Parent then
+		h.AssemblyLinearVelocity = Vector3.zero
+	end
+	if hum then hum.PlatformStand = false end
+	return true
+end
+
+-- Wait for CarryChanged (Lennon style)
+local function waitCarry(uid, timeout)
+	timeout = timeout or 8
+	if not EggState or not EggState.CarryChanged then
+		task.wait(0.5)
+		return true
+	end
+	local got = false
+	local conn
+	conn = EggState.CarryChanged:Connect(function(info)
+		if info and info.IsCarrying and info.Uid == uid then
+			got = true
+		end
+	end)
+	local t0 = tick()
+	while not got and tick() - t0 < timeout do
+		if not S.Enabled then break end
+		task.wait(0.05)
+	end
+	if conn then conn:Disconnect() end
+	return got
+end
+
+-- ===== TELEGUIADO CYCLE (Lennon) =====
+local function runTeleguiado()
+	if busy or not S.Enabled then return end
+	if not canSteal() then
+		setStatus(isDay() and "Gate..." or "Dia...")
+		return
+	end
+	busy = true
+	setStatus("Inicio...")
+
+	-- 1) Ir al punto inicio
+	tweenTo(START, S.Speed)
+	if not S.Enabled then busy = false return end
+
+	local best, startE = fetchEggs()
+
+	-- 2) Robar huevo inicio (obligatorio estilo Lennon)
+	if startE then
+		setStatus("Robando inicio")
+		tweenTo(startE.Position, S.Speed)
+		task.spawn(function()
+			spamCarry(startE, 20)
+		end)
+		local ok = waitCarry(startE.Uid, 6)
+		if not ok then
+			-- reintentar spam
+			spamCarry(startE, 15)
+			waitCarry(startE.Uid, 3)
+		end
+	end
+
+	if not S.Enabled then busy = false setStatus("Off") return end
+
+	-- 3) Ir al mejor huevo filtrado
+	best = select(1, fetchEggs())
+	local target = best and best[1]
+	if not target then
+		setStatus("Sin rareza")
+		if S.GoSafe then tweenTo(SAFE, S.Speed) end
+		busy = false
+		return
+	end
+
+	setStatus("-> " .. (target.Rarity or "?") .. " " .. (target.Name or ""))
+	tweenTo(target.Position, S.Speed)
+	if not S.Enabled then busy = false return end
+
+	setStatus("Robando " .. (target.Rarity or ""))
+	task.spawn(function()
+		spamCarry(target, 40)
+	end)
+	local grabbed = waitCarry(target.Uid, 8)
+	if not grabbed then
+		spamCarry(target, 20)
+	end
+
+	-- 4) Volver a safe + proteger
+	if S.GoSafe then
+		setStatus("Safe zone")
+		task.spawn(function()
+			for i = 1, 20 do
+				if not S.Enabled then break end
+				carryEgg(target)
+				task.wait(0.06)
+			end
+		end)
+		tweenTo(SAFE, math.min(S.Speed, 600))
+	end
+
+	setStatus(S.Loop and "Listo (loop)" or "Listo")
+	busy = false
+end
+
+-- ===== UI COMPACTA =====
+do
+	local parent = guiParent()
+	local old = parent:FindFirstChild("LennonMini")
+	if old then old:Destroy() end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "LennonMini"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999999
+	gui.Parent = parent
+
+	local W, H = 200, 268
+	local main = Instance.new("Frame")
+	main.Size = UDim2.fromOffset(W, H)
+	main.Position = UDim2.new(0, 10, 0.35, 0)
+	main.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+	main.BorderSizePixel = 0
+	main.Active = true
+	main.Parent = gui
+	Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+	local st = Instance.new("UIStroke", main)
+	st.Color = Color3.fromRGB(130, 70, 220)
+	st.Thickness = 1.2
+
+	local head = Instance.new("Frame")
+	head.Size = UDim2.new(1, 0, 0, 30)
+	head.BackgroundColor3 = Color3.fromRGB(22, 20, 28)
+	head.BorderSizePixel = 0
+	head.Parent = main
+	Instance.new("UICorner", head).CornerRadius = UDim.new(0, 10)
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -36, 1, 0)
+	title.Position = UDim2.fromOffset(10, 0)
+	title.BackgroundTransparency = 1
+	title.Text = "Lennon Steal"
+	title.TextColor3 = Color3.fromRGB(235, 230, 255)
+	title.TextSize = 13
+	title.Font = Enum.Font.GothamBold
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = head
+
+	local minBtn = Instance.new("TextButton")
+	minBtn.Size = UDim2.fromOffset(24, 24)
+	minBtn.Position = UDim2.new(1, -28, 0.5, -12)
+	minBtn.BackgroundColor3 = Color3.fromRGB(40, 38, 52)
+	minBtn.Text = "–"
+	minBtn.TextColor3 = Color3.fromRGB(240, 240, 240)
+	minBtn.TextSize = 14
+	minBtn.Font = Enum.Font.GothamBold
+	minBtn.AutoButtonColor = false
+	minBtn.Parent = head
+	Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 6)
+
+	local body = Instance.new("Frame")
+	body.Name = "Body"
+	body.Size = UDim2.new(1, -12, 1, -38)
+	body.Position = UDim2.fromOffset(6, 34)
+	body.BackgroundTransparency = 1
+	body.Parent = main
+
+	statusLbl = Instance.new("TextLabel")
+	statusLbl.Size = UDim2.new(1, 0, 0, 16)
+	statusLbl.BackgroundTransparency = 1
+	statusLbl.Text = "Idle"
+	statusLbl.TextColor3 = Color3.fromRGB(160, 155, 180)
+	statusLbl.TextSize = 11
+	statusLbl.Font = Enum.Font.Gotham
+	statusLbl.TextXAlignment = Enum.TextXAlignment.Left
+	statusLbl.Parent = body
+
+	local function mk(txt, y, def, cb)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, 0, 0, 26)
+		b.Position = UDim2.fromOffset(0, y)
+		b.BackgroundColor3 = def and Color3.fromRGB(95, 55, 165) or Color3.fromRGB(30, 28, 40)
+		b.Text = txt .. (def and " ON" or " OFF")
+		b.TextColor3 = Color3.fromRGB(235, 235, 245)
+		b.TextSize = 11
+		b.Font = Enum.Font.GothamBold
+		b.AutoButtonColor = false
+		b.Parent = body
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+		local on = def
+		b.MouseButton1Click:Connect(function()
+			on = not on
+			b.Text = txt .. (on and " ON" or " OFF")
+			b.BackgroundColor3 = on and Color3.fromRGB(95, 55, 165) or Color3.fromRGB(30, 28, 40)
+			cb(on)
+		end)
+	end
+
+	mk("Auto Steal", 20, false, function(v)
+		S.Enabled = v
+		setStatus(v and "Armado..." or "Idle")
+	end)
+	mk("Loop", 50, true, function(v) S.Loop = v end)
+	mk("Safe Zone", 80, true, function(v) S.GoSafe = v end)
+	mk("Esperar Dia", 110, true, function(v) S.WaitDay = v end)
+
+	-- Rarezas en fila compacta
+	local rareLab = Instance.new("TextLabel")
+	rareLab.Size = UDim2.new(1, 0, 0, 14)
+	rareLab.Position = UDim2.fromOffset(0, 140)
+	rareLab.BackgroundTransparency = 1
+	rareLab.Text = "Rarezas"
+	rareLab.TextColor3 = Color3.fromRGB(150, 145, 170)
+	rareLab.TextSize = 10
+	rareLab.Font = Enum.Font.Gotham
+	rareLab.TextXAlignment = Enum.TextXAlignment.Left
+	rareLab.Parent = body
+
+	local rares = { { "Sec", "secret" }, { "Ete", "eternal" }, { "Div", "divine" }, { "Cos", "cosmic" } }
+	for i, r in ipairs(rares) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(44, 22)
+		b.Position = UDim2.fromOffset((i - 1) * 47, 156)
+		b.BackgroundColor3 = Rarities[r[2]] and Color3.fromRGB(95, 55, 165) or Color3.fromRGB(30, 28, 40)
+		b.Text = r[1]
+		b.TextColor3 = Color3.fromRGB(235, 235, 245)
+		b.TextSize = 10
+		b.Font = Enum.Font.GothamBold
+		b.AutoButtonColor = false
+		b.Parent = body
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+		b.MouseButton1Click:Connect(function()
+			Rarities[r[2]] = not Rarities[r[2]]
+			b.BackgroundColor3 = Rarities[r[2]] and Color3.fromRGB(95, 55, 165) or Color3.fromRGB(30, 28, 40)
+		end)
+	end
+
+	local hopBtn = Instance.new("TextButton")
+	hopBtn.Size = UDim2.new(1, 0, 0, 26)
+	hopBtn.Position = UDim2.fromOffset(0, 186)
+	hopBtn.BackgroundColor3 = Color3.fromRGB(55, 45, 90)
+	hopBtn.Text = "Server Hop"
+	hopBtn.TextColor3 = Color3.fromRGB(240, 240, 245)
+	hopBtn.TextSize = 11
+	hopBtn.Font = Enum.Font.GothamBold
+	hopBtn.AutoButtonColor = false
+	hopBtn.Parent = body
+	Instance.new("UICorner", hopBtn).CornerRadius = UDim.new(0, 6)
+	hopBtn.MouseButton1Click:Connect(function()
+		setStatus("Hop...")
+		task.spawn(function()
+			local lowest
+			local ok, body = pcall(function()
+				return game:HttpGet("https://games.roblox.com/v1/games/" .. PLACE_ID .. "/servers/Public?sortOrder=Asc&limit=100")
+			end)
+			if ok and body then
+				local ok2, data = pcall(HttpService.JSONDecode, HttpService, body)
+				if ok2 and data and data.data then
+					for _, s in ipairs(data.data) do
+						local p = tonumber(s.playing) or 99
+						if s.id and s.id ~= game.JobId and (not lowest or p < lowest.p) then
+							lowest = { id = s.id, p = p }
+						end
+					end
+				end
+			end
+			if lowest then
+				pcall(function()
+					TeleportService:TeleportToPlaceInstance(PLACE_ID, lowest.id, LP)
+				end)
+			else
+				pcall(function()
+					TeleportService:Teleport(PLACE_ID, LP)
+				end)
+			end
+		end)
+	end)
+
+	-- Minimize + drag
+	local minimized = false
+	minBtn.MouseButton1Click:Connect(function()
+		minimized = not minimized
+		body.Visible = not minimized
+		main.Size = minimized and UDim2.fromOffset(W, 30) or UDim2.fromOffset(W, H)
+		minBtn.Text = minimized and "+" or "–"
+	end)
+
+	local drag, d0, p0
+	head.InputBegan:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			drag = true
+			d0 = inp.Position
+			p0 = main.Position
+		end
+	end)
+	UIS.InputEnded:Connect(function(inp)
+		if inp.UserInputType == Enum.UserInputType.MouseButton1 or inp.UserInputType == Enum.UserInputType.Touch then
+			drag = false
+		end
+	end)
+	UIS.InputChanged:Connect(function(inp)
+		if drag and (inp.UserInputType == Enum.UserInputType.MouseMovement or inp.UserInputType == Enum.UserInputType.Touch) then
+			local d = inp.Position - d0
+			main.Position = UDim2.new(p0.X.Scale, p0.X.Offset + d.X, p0.Y.Scale, p0.Y.Offset + d.Y)
+		end
+	end)
+
+	print("[Lennon] UI lista")
+end
+
+-- Loop
+task.spawn(function()
+	while true do
+		task.wait(0.5)
+		if S.Enabled and not busy then
+			if not AskSnap then
+				setStatus("Remotes...")
+			else
+				local ok, err = pcall(runTeleguiado)
+				if not ok then
+					setStatus("Error")
+					warn("[Lennon]", err)
+					busy = false
+				end
+				if not S.Loop then
+					S.Enabled = false
+					setStatus("Idle")
+				else
+					task.wait(0.8)
+				end
+			end
+		end
+	end
+end)
+
+print("[Lennon] TELEGUIADO listo")
